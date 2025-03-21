@@ -1,8 +1,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "../include/hal.h"
-#include "include/bios.h"
+#include "hal.h"
+#include "bios.h"
 
 __at (BIOS_HWVER) uint8_t msx_version;
 __at (BIOS_LINL40) uint8_t text_columns;

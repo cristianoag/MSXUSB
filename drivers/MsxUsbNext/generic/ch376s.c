@@ -170,6 +170,7 @@ bool ch376_get_sector_LBA (uint8_t nr_sectors,uint8_t* sectors_allowed_lba)
     return true;
 }
 
+
 bool ch376s_disk_read (uint8_t nr_sectors,uint8_t* lba,uint8_t* sector_buffer)
 {
     write_command (CMD_DISK_READ);
