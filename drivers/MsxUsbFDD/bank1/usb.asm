@@ -463,6 +463,8 @@ _USB_INIT_DEV_ERR:
     ld hl,(CH_NAK_COUNT)
     ld (USB_INIT_NAK_COUNT),hl
 
+    if EP0_DIAGNOSTICS = 1
+
     ;Diagnostics: if getting a descriptor from the device failed after the
     ;address was assigned, check if it answers single packet requests
     ;at the new address and at address 0.
@@ -473,6 +475,8 @@ _USB_INIT_DEV_ERR:
     cp 6
     call c,_USB_INIT_PROBE
 _USB_INIT_DEV_ERR_2:
+
+    endif
 
     call WK_ZERO
     pop bc
@@ -487,6 +491,8 @@ _USB_INIT_DEV_END:
     ;* Get 8 bytes of the device descriptor at address 1 and at address 0,
     ;  and store the resulting CH376 status of each transfer.
     ;  Input: buffer at SP+4 (the caller has pushed AF)
+
+    if EP0_DIAGNOSTICS = 1
 
 _USB_INIT_PROBE:
     ld hl,4
@@ -507,6 +513,8 @@ _USB_INIT_PROBE:
     ld a,(CH_LAST_STATUS)
     ld (USB_PROBE_ADDR0_STATUS),a
     ret
+
+    endif
 
     ;* Skip the current descriptor
 
@@ -639,8 +647,16 @@ _USB_PROBE_END:
     ;Input:  E = Endpoint number, buffer address at SP+2
     ;Output: Z if data was received (and then the bulk IN toggle bit is updated),
     ;        NZ and A = USB error code if not
+    ;The CH376 NAK retries are disabled and retries are done by software for max 200ms
+    ;(instead of 3s), since a NAK here likely means that we're using the wrong endpoint.
 
 _USB_PROBE_BULK_IN:
+    ld a,3Fh
+    call CH_SET_RETRY_VALUE
+    ld a,USB_DEVICE_ADDRESS
+    call CH_SET_TARGET_DEVICE_ADDRESS
+    ld hl,200
+    ld (CH_SW_NAK_LEFT),hl
     ld hl,2
     add hl,sp
     ld a,(hl)
@@ -649,9 +665,12 @@ _USB_PROBE_BULK_IN:
     ld l,a
     ld d,64
     ld bc,36
-    ld a,USB_DEVICE_ADDRESS
     or a    ;Toggle = 0
-    call HW_DATA_IN_TRANSFER
+    call CH_DATA_IN_TRANSFER    ;Not HW_DATA_IN_TRANSFER, which disables software NAK retries
+    push af
+    or a
+    call HW_CONFIGURE_NAK_RETRY ;Restore the default NAK retry mode
+    pop af
     push af
     or a
     jr nz,_USB_PROBE_BULK_IN_ERR

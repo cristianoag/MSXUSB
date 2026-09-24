@@ -47,7 +47,7 @@ DEBUG_DSKIO: equ 0
 
 ;Enable to run a set of endpoint 0 transfer experiments and print the results
 ;when the device initialization fails when getting descriptors (steps 4 and 5)
-EP0_DIAGNOSTICS: equ 1
+EP0_DIAGNOSTICS: equ 0
 
 ;Enable to wait for a key press after displaying the device information
 ;at boot time

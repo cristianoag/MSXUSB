@@ -99,8 +99,9 @@ _VERBOSE_RESET_NO_STOR:
     ld hl,DEVERR_STEP_S
     call PRINT_ERROR
 
-    ;Diagnostics: raw CH376 status of the failed operation, and for steps 4 and 5,
-    ;status of single packet GET_DESCRIPTOR requests at address 1 and at address 0
+    ;Diagnostics: raw CH376 status of the failed operation, and NAKs retried.
+    ;If EP0_DIAGNOSTICS=1, for steps 4 and 5 also the status of single packet
+    ;GET_DESCRIPTOR requests at address 1 and at address 0, and the endpoint 0 experiments.
 
     ld hl,DEVERR_STATUS_S
     call PRINT
@@ -112,6 +113,8 @@ _VERBOSE_RESET_NO_STOR:
     call PRINT_HEX
     ld a,(USB_INIT_NAK_COUNT)
     call PRINT_HEX
+
+    if EP0_DIAGNOSTICS = 1
     ld a,(USB_INIT_STEP)
     cp 4
     jr c,_VERBOSE_RESET_DIAG_END
@@ -125,14 +128,12 @@ _VERBOSE_RESET_NO_STOR:
     call PRINT
     ld a,(USB_PROBE_ADDR0_STATUS)
     call PRINT_HEX
-
-    if EP0_DIAGNOSTICS = 1
     ld hl,CRLF_S
     call PRINT
     call DIAG_EP0
+_VERBOSE_RESET_DIAG_END:
     endif
 
-_VERBOSE_RESET_DIAG_END:
     ld hl,CRLF_S
     jp PRINT
 
@@ -342,9 +343,9 @@ PRINT_ERROR:
 ; Strings
 
 ROOKIE_S:
-	db "USBHOST NestorBIOS v2.1",13,10
+	db "USBHOST NestorBIOS v2.2",13,10
 	db "(c) 2018-2022 Konamiman",13,10
-    db "(c) 2024 The Retro Hacker",13,10
+    db "(c) 2026 The Retro Hacker",13,10
 	db 13,10
     db "Initializing device...",13
 	db 0
@@ -378,11 +379,15 @@ DEVERR_STATUS_S:
 DEVERR_NAKS_S:
     db  ", NAKs: ",0
 
+    if EP0_DIAGNOSTICS = 1
+
 DEVERR_PROBE1_S:
     db  ", probe @1: ",0
 
 DEVERR_PROBE0_S:
     db  ", @0: ",0
+
+    endif
 
 ERR_INQUIRY_S:
     db  "ERROR querying the device name: ",0

@@ -129,6 +129,8 @@ CH_NAK_COUNT: equ PROCNM+12
 
 ;Maximum software NAK retries in a control transfer, there's a 1ms delay between retries
 CH_SW_NAK_RETRIES: equ 3000
+;Same for GET_DESCRIPTOR requests
+CH_SW_NAK_RETRIES_DESCR: equ 100
 
 
 ; -----------------------------------------------------------------------------
@@ -275,13 +277,26 @@ HW_CONTROL_TRANSFER:
 
     push hl
     push bc
-    ld hl,CH_SW_NAK_RETRIES
+    ld bc,CH_SW_NAK_RETRIES
     ld a,(CH_NAK_MODE)
     cp 0BFh
+    jr nz,_HW_CONTROL_TRANSFER_1
+    ld bc,0FFFFh    ;Indefinite retry mode configured: retry NAKs indefinitely too
+    jr _HW_CONTROL_TRANSFER_2
+_HW_CONTROL_TRANSFER_1:
+    ld a,(hl)
+    cp 80h
     jr nz,_HW_CONTROL_TRANSFER_2
-    ld hl,0FFFFh    ;Indefinite retry mode configured: retry NAKs indefinitely too
+    inc hl
+    ld a,(hl)
+    cp 6
+    jr nz,_HW_CONTROL_TRANSFER_2
+    ;GET_DESCRIPTOR requests are answered by the device firmware right away,
+    ;so a long NAK means that the data won't come at all
+    ;(see "single packet mode" in USB_INIT_DEV).
+    ld bc,CH_SW_NAK_RETRIES_DESCR
 _HW_CONTROL_TRANSFER_2:
-    ld (CH_SW_NAK_LEFT),hl
+    ld (CH_SW_NAK_LEFT),bc
     ld hl,0
     ld (CH_NAK_COUNT),hl
     ld a,3Fh    ;Don't retry NAKs, 63 retries on device timeout
