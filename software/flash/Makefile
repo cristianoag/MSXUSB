@@ -25,7 +25,7 @@ CCFLAGS = $(VERBOSE) --code-loc $(ADDR_CODE) --data-loc $(ADDR_DATA) --disable-w
 SOURCES = flash.c
 OUTFILE = flash.com
 
-.PHONY: all compile package clean
+.PHONY: all compile package clean test
 
 all: clean compile package
 
@@ -50,4 +50,4 @@ clean:
 		rm -f $(BINDIR)/$(OUTFILE)
 
 test:
-	@echo $(BINDIR)/$(basename $(OUTFILE)).ihx
+	node tests/run.js

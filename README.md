@@ -62,7 +62,13 @@ The flash.com command has the following syntax:
 flash.com <filename>.rom
 ```
 
-The flash.com program can only detect M29F040 or M29F010 flash chips. If you have a different flash chip (assuming it is compatible) you will need a flash programmer to flash the bios.
+The [flash.com tool](software/flash/dist/flash.com) supports AMC_A29040B (AMIC A29040B), AMD_AM29F040, AMD_AM29F010 and SST_SST39SF040 chips. It detects the chip and selects the appropriate identification, erase and programming commands. Other chips require an external flash programmer.
+
+Use `flash.com /S1 <filename>.rom` (or `/S0`, `/S2`, `/S3`) to select a primary slot instead of scanning all four slots. The selected slot is still checked for a supported chip before erasing. The tool erases the entire flash chip, not just the space occupied by the ROM file.
+
+SST39SF040 commands use flash addresses `0x5555` and `0x2AAA`, rather than the shorter AMD/AMIC unlock addresses. The tool maps dedicated 8 KB command banks and temporarily replaces page 2 RAM while issuing SST commands, restoring RAM before accessing the file buffer or DOS. SST detection requires the stack to be in page 3, with at least 256 bytes available above `0xC000`. This requires the MSX-USB mapper's `5x00`/`7x00`/`9x00` bank-register decoding, as implemented by the v3, v4 and v5 CPLD sources. On v4, select the first ROM bank with the hardware switch so flash address zero is accessible for SST identification.
+
+The host-side flash regression tests can be run with `make -C software/flash test` (Node.js and a C++17 `g++` compiler are required; `CXX` can select another compatible compiler). They exercise the actual C protocol and command-line code against a simulated flash chip and cartridge mapper; they do not replace testing on physical hardware. SST command and polling behavior follows the [Microchip datasheet](https://ww1.microchip.com/downloads/aemDocuments/documents/MPD/ProductDocuments/DataSheets/SST39SF010A-SST39SF020A-SST39SF040-Data-Sheet-DS20005022.pdf).
 
 ### USB Host BIOS (USBHOST.ROM)
 

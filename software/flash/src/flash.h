@@ -23,9 +23,11 @@ const BOOL TRUE=1;
 const BOOL FALSE=0;
 
 uint8_t find_flash ();
-BOOL flash_ident ();
+BOOL flash_ident (uint8_t slot);
 void select_ramslot_40 ();
 void select_slot_40 (uint8_t slot);
+void select_ramslot_80 ();
+void select_slot_80 (uint8_t slot);
 BOOL erase_flash(uint8_t slot);
 BOOL erase_flash_sectors (uint8_t slot,uint8_t sector_start,uint8_t sector_end);
 BOOL write_flash_segment (uint8_t slot,uint8_t segment);
