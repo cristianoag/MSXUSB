@@ -79,7 +79,7 @@ _WK_SET_EP_SIZE_DO:
     rrc c
     rrc c
     ld a,(hl)
-    and 11001111b
+    and 10011111b   ;Clear the old size (bits 6-5)
     or c
     ld (hl),a
     pop ix

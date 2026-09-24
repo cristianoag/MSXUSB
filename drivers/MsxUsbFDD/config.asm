@@ -45,6 +45,10 @@ USING_ARDUINO_BOARD: equ 0
 ;the input parameters are printed, and system stops waiting for a key press
 DEBUG_DSKIO: equ 0
 
+;Enable to run a set of endpoint 0 transfer experiments and print the results
+;when the device initialization fails when getting descriptors (steps 4 and 5)
+EP0_DIAGNOSTICS: equ 1
+
 ;Enable to wait for a key press after displaying the device information
 ;at boot time
 WAIT_KEY_ON_INIT: equ 0

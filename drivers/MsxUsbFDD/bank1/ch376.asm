@@ -31,11 +31,17 @@
 ; shortcuts, or leave the constants to 0 if not.
 ;
 ; HW_IMPL_<routine> needs to be 1 if HW_<routine> is implemented.
+;
+; The CH376 built-in GET_DESCR shortcut is not used: descriptors are always
+; read with HW_CONTROL_TRANSFER, which honors the endpoint 0 max packet size
+; of the device (it is only 8 bytes in some FDDs, e.g. TEAC FD-05PUB).
+; SET_ADDRESS and SET_CONFIGURATION are also sent with HW_CONTROL_TRANSFER,
+; so that the whole enumeration uses the same, well known, transfer code.
 
-HW_IMPL_GET_DEV_DESCR: equ 1
-HW_IMPL_GET_CONFIG_DESCR: equ 1
-HW_IMPL_SET_CONFIG: equ 1
-HW_IMPL_SET_ADDRESS: equ 1
+HW_IMPL_GET_DEV_DESCR: equ 0
+HW_IMPL_GET_CONFIG_DESCR: equ 0
+HW_IMPL_SET_CONFIG: equ 0
+HW_IMPL_SET_ADDRESS: equ 0
 HW_IMPL_CONFIGURE_NAK_RETRY: equ 1
 
 
@@ -110,6 +116,20 @@ CH_ST_INT_DISK_ERR: equ 1Fh
 CH_ST_RET_SUCCESS: equ 51h
 CH_ST_RET_ABORT: equ 5Fh
 
+;Scratch byte (in the BASIC CALL statement name buffer) where the raw
+;CH376 status of the last operation is stored, for diagnostics
+CH_LAST_STATUS: equ PROCNM+5
+
+;Value passed to the last HW_CONFIGURE_NAK_RETRY call
+CH_NAK_MODE: equ PROCNM+9
+;Remaining software NAK retries for the current control transfer (word, FFFFh = indefinite)
+CH_SW_NAK_LEFT: equ PROCNM+10
+;NAKs retried by software in the current control transfer (word), for diagnostics
+CH_NAK_COUNT: equ PROCNM+12
+
+;Maximum software NAK retries in a control transfer, there's a 1ms delay between retries
+CH_SW_NAK_RETRIES: equ 3000
+
 
 ; -----------------------------------------------------------------------------
 ; Mandatory routines
@@ -166,7 +186,7 @@ HW_RESET:
 
     ;Clear the CH376 data buffer in case a reset was made
     ;while it was in the middle of a data transfer operation
-    ;ld b,64
+    ld b,64
 _HW_RESET_CLEAR_DATA_BUF:
     in a,(CH_DATA_PORT)
     djnz _HW_RESET_CLEAR_DATA_BUF
@@ -248,6 +268,44 @@ HW_DEV_CHANGE:
 HW_CONTROL_TRANSFER:
     call CH_SET_TARGET_DEVICE_ADDRESS
 
+    ;Some devices (e.g. TEAC FD-05PUB) NAK the IN packets of a multi-packet data stage
+    ;on endpoint 0 for a short time, and the CH376 limited NAK retry mode gives up
+    ;too early for them. So during control transfers the CH376 is told to not retry NAKs
+    ;at all, and the retries are done by software (see _CH_CHECK_NAK_RETRY).
+
+    push hl
+    push bc
+    ld hl,CH_SW_NAK_RETRIES
+    ld a,(CH_NAK_MODE)
+    cp 0BFh
+    jr nz,_HW_CONTROL_TRANSFER_2
+    ld hl,0FFFFh    ;Indefinite retry mode configured: retry NAKs indefinitely too
+_HW_CONTROL_TRANSFER_2:
+    ld (CH_SW_NAK_LEFT),hl
+    ld hl,0
+    ld (CH_NAK_COUNT),hl
+    ld a,3Fh    ;Don't retry NAKs, 63 retries on device timeout
+    call CH_SET_RETRY_VALUE
+    pop bc
+    pop hl
+
+    call _HW_CONTROL_TRANSFER
+
+    ;Restore the NAK retry mode
+
+    push af
+    push bc
+    ld a,(CH_NAK_MODE)
+    cp 0BFh
+    jr z,_HW_CONTROL_TRANSFER_3
+    ld a,0FFh
+_HW_CONTROL_TRANSFER_3:
+    call CH_SET_RETRY_VALUE
+    pop bc
+    pop af
+    ret
+
+_HW_CONTROL_TRANSFER:
     push hl
     push bc
     push de
@@ -285,13 +343,11 @@ _CH_CONTROL_IN_TRANSFER:
 
     push bc
 
+    ld hl,0
     ld b,0
-    call CH_WRITE_DATA
     ld e,0
-    ld b,CH_PID_OUT
     ld a,40h    ;Toggle bit = 1
-    call CH_ISSUE_TOKEN
-    call CH_WAIT_INT_AND_GET_RESULT
+    call _CH_OUT_PACKET
 
     pop bc
     ret
@@ -305,12 +361,12 @@ _CH_CONTROL_STATUS_IN_TRANSFER:
     push bc
 
     ld e,0
-    ld b,CH_PID_IN
     ld a,80h    ;Toggle bit = 1
-    call CH_ISSUE_TOKEN
+    call _CH_IN_TOKEN   ;Waits for the transaction to finish before reading data
+    push af
     ld hl,0
     call CH_READ_DATA
-    call CH_WAIT_INT_AND_GET_RESULT
+    pop af
 
     pop bc
     ret
@@ -331,6 +387,7 @@ _CH_CONTROL_STATUS_IN_TRANSFER:
 
 HW_DATA_IN_TRANSFER:
     call CH_SET_TARGET_DEVICE_ADDRESS
+    call _CH_NO_SW_NAK_RETRY
 
 ; This entry point is used when target device address is already set
 CH_DATA_IN_TRANSFER:
@@ -345,10 +402,7 @@ _CH_DATA_IN_LOOP:
     push bc ;Remaining length
 
     ld e,iyl
-    ld b,CH_PID_IN
-    call CH_ISSUE_TOKEN
-
-    call CH_WAIT_INT_AND_GET_RESULT
+    call _CH_IN_TOKEN
     or a
     jr nz,_CH_DATA_IN_ERR   ;DONE if error
 
@@ -413,6 +467,7 @@ _CH_DATA_IN_ERR:
 
 HW_DATA_OUT_TRANSFER:
     call CH_SET_TARGET_DEVICE_ADDRESS
+    call _CH_NO_SW_NAK_RETRY
 
 ; This entry point is used when target device address is already set
 CH_DATA_OUT_TRANSFER:
@@ -446,18 +501,13 @@ _CH_DATA_OUT_DO:
     ex (sp),hl     ;Updated remaining data length to the stack
 
     ld b,a
-    call CH_WRITE_DATA
-
-    pop bc
+    pop de
     pop af  ;Retrieve toggle
     push af
-    push bc
+    push de
 
     ld e,iyl
-    ld b,CH_PID_OUT
-    call CH_ISSUE_TOKEN
-
-    call CH_WAIT_INT_AND_GET_RESULT
+    call _CH_OUT_PACKET
     or a
     jr nz,_CH_DATA_OUT_DONE   ;DONE if error
 
@@ -486,6 +536,133 @@ _CH_DATA_OUT_DONE_2:
     ret
 
 
+; --------------------------------------
+; _CH_IN_TOKEN: Execute an IN transaction, retrying on NAK if enabled
+;
+; Input:  A = Toggle bit in bit 7
+;         E = Endpoint number
+; Output: A = USB error code
+; Preserves HL, E, IX, IY
+
+_CH_IN_TOKEN:
+    push af
+    ld b,CH_PID_IN
+    call CH_ISSUE_TOKEN
+    call CH_WAIT_INT_AND_GET_RESULT
+    call _CH_CHECK_NAK_RETRY
+    jr z,_CH_IN_TOKEN_RETRY
+    inc sp  ;Discard toggle, keep error code in A
+    inc sp
+    ret
+_CH_IN_TOKEN_RETRY:
+    pop af
+    jr _CH_IN_TOKEN
+
+
+; --------------------------------------
+; _CH_OUT_PACKET: Write data to the CH376 buffer and execute an OUT transaction,
+; retrying on NAK if enabled (the data is written again before each retry)
+;
+; Input:  HL = Address of the data
+;         B  = Length of the data
+;         A  = Toggle bit in bit 6
+;         E  = Endpoint number
+; Output: A  = USB error code
+;         HL = HL + B
+; Preserves E, IX, IY
+
+_CH_OUT_PACKET:
+    push hl
+    push de
+    push bc
+    push af
+    call CH_WRITE_DATA
+    pop af
+    push af
+    ld b,CH_PID_OUT
+    call CH_ISSUE_TOKEN
+    call CH_WAIT_INT_AND_GET_RESULT
+    call _CH_CHECK_NAK_RETRY
+    jr z,_CH_OUT_PACKET_RETRY
+    pop de  ;Discard toggle
+    pop bc
+    pop de
+    pop hl
+    push af
+    ld c,b
+    ld b,0
+    add hl,bc
+    pop af
+    ret
+_CH_OUT_PACKET_RETRY:
+    pop af
+    pop bc
+    pop de
+    pop hl
+    jr _CH_OUT_PACKET
+
+
+; --------------------------------------
+; _CH_CHECK_NAK_RETRY: Check if a transaction that got a NAK must be retried
+;
+; If so, waits 1ms before returning.
+;
+; Input:  A = USB error code of the transaction
+; Output: Z if the transaction must be retried
+;         NZ if not, A preserved
+; Preserves HL, DE, IX, IY
+
+_CH_CHECK_NAK_RETRY:
+    cp USB_ERR_NAK
+    ret nz
+    push hl
+    ld hl,(CH_SW_NAK_LEFT)
+    ld a,h
+    or l
+    jr z,_CH_CHECK_NAK_RETRY_NO
+    inc hl
+    ld a,h
+    or l
+    jr z,_CH_CHECK_NAK_RETRY_DO ;Was FFFFh: retry indefinitely
+    dec hl
+    dec hl
+    ld (CH_SW_NAK_LEFT),hl
+_CH_CHECK_NAK_RETRY_DO:
+    ld hl,(CH_NAK_COUNT)
+    inc hl
+    ld (CH_NAK_COUNT),hl
+    pop hl
+
+    if USING_ARDUINO_BOARD = 0
+    push bc
+    ld bc,10
+    call CH_DELAY
+    pop bc
+    endif
+
+    xor a   ;Z
+    ret
+
+_CH_CHECK_NAK_RETRY_NO:
+    pop hl
+    ld a,USB_ERR_NAK
+    or a    ;NZ
+    ret
+
+
+; --------------------------------------
+; _CH_NO_SW_NAK_RETRY: Disable the NAK retries by software
+; (used for bulk and interrupt transfers, the CH376 retries these by itself)
+; Preserves all registers except F
+
+_CH_NO_SW_NAK_RETRY:
+    push hl
+    ld hl,0
+    ld (CH_SW_NAK_LEFT),hl
+    pop hl
+    ret
+
+
 ; -----------------------------------------------------------------------------
 ; HW_BUS_RESET: Performs a USB bus reset.
 ;
@@ -501,7 +678,7 @@ HW_BUS_RESET:
     ret c
 
     if USING_ARDUINO_BOARD = 0
-    ld bc,150
+    ld bc,200   ;20ms, same as Windows with USB 2.0 hubs (10ms minimum)
     call CH_DELAY
     endif
 
@@ -510,6 +687,15 @@ HW_BUS_RESET:
 
     ld a,1
     ret c
+
+    ;Reset recovery time: the device may ignore requests received
+    ;less than 10ms after the end of the bus reset, and some devices
+    ;need more; Windows waits between 30 and 45ms.
+
+    if USING_ARDUINO_BOARD = 0
+    ld bc,500
+    call CH_DELAY
+    endif
 
     xor a
     inc a
@@ -1309,6 +1495,16 @@ HW_SET_ADDRESS:
     out (CH_DATA_PORT),a
 
     call CH_WAIT_INT_AND_GET_RESULT
+
+    ;SET_ADDRESS recovery time: 2ms minimum, give it some more
+
+    if USING_ARDUINO_BOARD = 0
+    push af
+    ld bc,100
+    call CH_DELAY
+    pop af
+    endif
+
     ret
 
     endif    
@@ -1327,11 +1523,7 @@ HW_CONFIGURE_NAK_RETRY:
     jr nc,_HW_CONFIGURE_NAK_RETRY_2
     ld a,0BFh
 _HW_CONFIGURE_NAK_RETRY_2:
-    push af
-    ld a,CH_CMD_SET_RETRY
-    out (CH_COMMAND_PORT),a
-    ld a,25h    ;Fixed value, required by CH376
-    out (CH_DATA_PORT),a
+    ld (CH_NAK_MODE),a  ;HW_CONTROL_TRANSFER needs to know the configured mode
 
     ;Bits 7 and 6:
     ;  0x: Don't retry NAKs
@@ -1339,6 +1531,14 @@ _HW_CONFIGURE_NAK_RETRY_2:
     ;  11: Retry NAKs for 3s
     ;Bits 5-0: Number of retries after device timeout
     ;Default after reset and SET_USB_MODE is 8Fh
+
+    ;Input: A = Value for the CH376 SET_RETRY command
+CH_SET_RETRY_VALUE:
+    push af
+    ld a,CH_CMD_SET_RETRY
+    out (CH_COMMAND_PORT),a
+    ld a,25h    ;Fixed value, required by CH376
+    out (CH_DATA_PORT),a
     pop af
     out (CH_DATA_PORT),a
     ret
@@ -1390,6 +1590,7 @@ CH_WAIT_INT_AND_GET_RESULT:
     jr nz,CH_WAIT_INT_AND_GET_RESULT    ;TODO: Perhaps add a timeout check here?
 
     call CH_GET_STATUS
+    ld (CH_LAST_STATUS),a   ;Raw status, for diagnostics
     cp USB_FILERR_MIN
     jr c,_CH_WAIT_INT_AND_GET_RESULT_2
     cp USB_FILERR_MAX+1
@@ -1501,12 +1702,15 @@ CH_SET_USB_MODE:
     ld a,b
     out (CH_DATA_PORT),a
 
-    ld b,255
+    ld bc,1000
 _CH_WAIT_USB_MODE:
     in a,(CH_DATA_PORT)
     cp CH_ST_RET_SUCCESS
     jp z,CH_CONFIGURE_RETRIES
-    djnz _CH_WAIT_USB_MODE
+    dec bc
+    ld a,b
+    or c
+    jr nz,_CH_WAIT_USB_MODE
     scf
     ret
 

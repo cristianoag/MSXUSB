@@ -24,6 +24,16 @@
 USB_DEVICE_ADDRESS: equ 1
 HUB_DEVICE_ADDRESS: equ 2
 
+;Scratch byte holding the current USB_INIT_DEV step, for error reporting
+;(PROCNM is also used as scratch space for the device VID and PID)
+USB_INIT_STEP: equ PROCNM+4
+;CH_LAST_STATUS is PROCNM+5 (see ch376.asm)
+USB_INIT_LAST_STATUS: equ PROCNM+6
+USB_PROBE_ADDR1_STATUS: equ PROCNM+7
+USB_PROBE_ADDR0_STATUS: equ PROCNM+8
+;PROCNM+9 to PROCNM+13 are used by ch376.asm
+USB_INIT_NAK_COUNT: equ PROCNM+14   ;Word
+
 USB_CLASS_MASS: equ 8
 USB_SUBCLASS_CBI: equ 4
 USB_PROTO_WITH_INT_EP: equ 0
@@ -114,27 +124,93 @@ USB_INIT_DEV:
     push hl
     call WK_ZERO
 
-    ;--- Initialize work area: assume max endpoint 0 packet size is 8 bytes
+    ;--- Initialize work area: assume max endpoint 0 packet size is 64 bytes,
+    ;    like Windows does. A device with a smaller size will then send
+    ;    a short packet and the first request will end after 8 bytes,
+    ;    which is enough to know the actual endpoint 0 max packet size.
 
-    ld a,8
+    ld a,64
     ld b,2
     call WK_SET_EP_SIZE
 
-    ;--- Get 8 first bytes of device descriptor, grab max endpoint 0 packet size
+    ;The enumeration sequence mimics the one used by Windows, since some devices
+    ;(e.g. TEAC FD-05PUB) are known to work with it and misbehave otherwise:
+    ;
+    ;1. Get device descriptor at address 0, requesting 64 bytes
+    ;   (with an assumed endpoint 0 max packet size of 64 bytes)
+    ;2. Bus reset again
+    ;3. SET_ADDRESS
+    ;4. Get the full device descriptor and the configuration descriptor
+    ;   at the new address
+    ;5. SET_CONFIGURATION
+    ;
+    ;Descriptors are read with our own control transfer routine, which honors the
+    ;endpoint 0 max packet size and handles multi-packet data stages
+    ;(it's 8 bytes in some FDDs, e.g. TEAC FD-05PUB).
+    ;
+    ;The current step number is stored at USB_INIT_STEP for error reporting.
 
     pop de
 _USB_INIT_DEV_RESTART:  ;Jumps here after hub init if hub is detected
     push de
 
-    if HW_IMPL_GET_DEV_DESCR = 1
+    ;--- Step 1: Get device descriptor at address 0, grab max endpoint 0 packet size
 
+    ld a,1
+    ld (USB_INIT_STEP),a
+    ld hl,USB_CMD_GET_DEV_DESC_64
     xor a
-    call HW_GET_DEV_DESCR
+    call _USB_INIT_CONTROL_TRANSFER
+
+    pop ix
+    or a
+    jp nz,_USB_INIT_DEV_ERR
+
+    ;The endpoint 0 max packet size must be known before any other request
+    ;with a data stage longer than 8 bytes is issued (also for hubs)
+
+    ld a,(ix+7)
+    push ix
+    ld b,2
+    call WK_SET_EP_SIZE
+    pop ix
+
+    call WK_GET_MISC_FLAGS
+    and 1
+    jr nz,_USB_INIT_SET_ADDRESS ;Device behind a hub: don't check hub again, don't reset the bus
+    ld a,(ix+4)
+    cp USB_CLASS_HUB
+    jp z,_USB_INIT_HUB_FOUND
+
+    ;--- Step 2: Bus reset
+
+    ld a,2
+    ld (USB_INIT_STEP),a
+    push ix
+    call HW_BUS_RESET
+    pop ix
+    ld a,USB_ERR_UNEXPECTED_STATUS_FROM_HOST
+    jp c,_USB_INIT_DEV_ERR
+
+    ;--- Step 3: Assign an address to the device
+
+_USB_INIT_SET_ADDRESS:
+    ld a,3
+    ld (USB_INIT_STEP),a
+    push ix
+
+    if HW_IMPL_SET_ADDRESS = 1
+
+    ld a,USB_DEVICE_ADDRESS
+    call HW_SET_ADDRESS
 
     else
 
-    ld hl,USB_CMD_GET_DEV_DESC_8
-    call USB_CONTROL_TRANSFER_0
+    ld hl,USB_CMD_SET_ADDRESS
+    ld de,0 ;No data will be actually transferred
+    xor a
+    call _USB_INIT_CONTROL_TRANSFER
+    call _USB_SET_ADDRESS_RECOVERY
 
     endif
 
@@ -142,22 +218,43 @@ _USB_INIT_DEV_RESTART:  ;Jumps here after hub init if hub is detected
     or a
     jp nz,_USB_INIT_DEV_ERR
 
-    call WK_GET_MISC_FLAGS
-    and 1
-    jr nz,_USB_INIT_DONT_CHECK_HUB ;To prevent infinite loops in case of hub init error
-    ld a,(ix+4)
-    cp USB_CLASS_HUB
-    jp z,_USB_INIT_HUB_FOUND
-_USB_INIT_DONT_CHECK_HUB:
+    ;--- Step 4: Get the full device descriptor
 
-    ld a,(ix+7)
+    ld a,4
+    ld (USB_INIT_STEP),a
     push ix
-    ld b,2
-    call WK_SET_EP_SIZE
+    pop de
+    push de
+    ld hl,USB_CMD_GET_DEV_DESC_18
+    ld a,USB_DEVICE_ADDRESS
+    call _USB_INIT_CONTROL_TRANSFER
+    pop ix
+    or a
+    jr z,_USB_INIT_DEV_DESC_OK
+
+    ;Some devices (e.g. TEAC FD-05PUB with endpoint 0 max packet size of 8 bytes)
+    ;never deliver the second packet of a control IN data stage to the CH376
+    ;(they NAK it indefinitely), but they work otherwise. In that case the first
+    ;packet is used, and the device is handled in "single packet mode":
+    ;only the first 8 bytes of the descriptors are read, and a standard
+    ;CBI+UFI interface layout is assumed (see _USB_INIT_FAKE_CONFIG_DESC).
+
+    cp USB_ERR_NAK
+    jp nz,_USB_INIT_DEV_ERR
+    ld a,c
+    cp 8
+    ld a,USB_ERR_NAK
+    jp c,_USB_INIT_DEV_ERR
+    ld hl,0FFFFh    ;VID/PID = FFFFh means "single packet mode"
+    ld (PROCNM),hl
+    ld (PROCNM+2),hl
+    push ix
+    jr _USB_INIT_GET_CONFIG_DESC
+
+_USB_INIT_DEV_DESC_OK:
+    push ix
 
     ;* HACK: Store VID and PID to allow Konamiman's non-standard FDD unit to be used
-
-    ;TODO: Get full device descriptor if HW_IMPL_GET_DEV_DESCR=0
 
     ld l,(ix+8)
     ld h,(ix+9)
@@ -166,26 +263,28 @@ _USB_INIT_DONT_CHECK_HUB:
     ld h,(ix+11)
     ld (PROCNM+2),hl
 
-    ;--- Get configuration descriptor (we'll look at the first configuration only)
+    ;--- Step 5: Get configuration descriptor (we'll look at the first configuration only)
 
+_USB_INIT_GET_CONFIG_DESC:
+    ld a,5
+    ld (USB_INIT_STEP),a
     pop de
     push de
 
-    if HW_IMPL_GET_CONFIG_DESCR = 1
-
-    xor a
-    call HW_GET_CONFIG_DESCR
-
-    else
-
     ld hl,USB_CMD_GET_CONFIG_DESC
-    call USB_CONTROL_TRANSFER_0
-
-    endif
+    call _USB_INIT_IS_SINGLE_PACKET_MODE
+    jr nz,_USB_INIT_GET_CONFIG_DESC_2
+    ld hl,USB_CMD_GET_CONFIG_DESC_8
+_USB_INIT_GET_CONFIG_DESC_2:
+    ld a,USB_DEVICE_ADDRESS
+    call _USB_INIT_CONTROL_TRANSFER
 
     pop ix
     or a
     jp nz,_USB_INIT_DEV_ERR
+
+    call _USB_INIT_IS_SINGLE_PACKET_MODE
+    call z,_USB_INIT_FAKE_CONFIG_DESC
 
     ld b,(ix+4) ;Number of interfaces
 
@@ -309,32 +408,12 @@ _INIT_USB_NEXT_EP:
     call _INIT_USB_SKIP_DESC
     djnz _INIT_USB_CONFIG_EP_LOOP
 
-    ;--- Assign an address to the device
+    ;--- Step 6: Assign the first configuration to the device
 
-    if HW_IMPL_SET_ADDRESS = 1
-
-    ld a,USB_DEVICE_ADDRESS
-    call HW_SET_ADDRESS
+    ld a,6
+    ld (USB_INIT_STEP),a
     push iy
     pop ix
-
-    else
-
-    push iy
-    ld hl,USB_CMD_SET_ADDRESS
-    ld de,0 ;No data will be actually transferred
-    call USB_CONTROL_TRANSFER_0
-    pop ix
-
-    endif
-
-    or a
-    jr nz,_USB_INIT_DEV_ERR
-
-    ;* We must use USB_CONTROL_TRANSFER (not _0) from this point
-
-    ;--- Assign the first configuration to the device
-
     ld a,(ix+5) ;bConfigurationValue in the configuration descriptor
 
     if HW_IMPL_SET_CONFIG = 1
@@ -356,15 +435,45 @@ _INIT_USB_NEXT_EP:
     ld (ix+2),a ;wValue in the SET_CONFIGURATION command
 
     ld de,0 ;No data will be actually transferred
-    call USB_CONTROL_TRANSFER
+    ld a,USB_DEVICE_ADDRESS
+    call _USB_INIT_CONTROL_TRANSFER
 
     endif
 
+    or a
+    jp nz,_USB_INIT_DEV_ERR
+
+    ;--- Step 7 (single packet mode only): find out the actual bulk endpoints
+
+    call _USB_INIT_IS_SINGLE_PACKET_MODE
+    ld a,0  ;Success (LD doesn't modify flags)
+    jr nz,_USB_INIT_DEV_END
+    ld a,7
+    ld (USB_INIT_STEP),a
+    push iy
+    pop ix  ;Buffer (the configuration descriptor is no longer needed)
+    call _USB_INIT_PROBE_BULK_EPS
     or a
     jr z,_USB_INIT_DEV_END
 
 _USB_INIT_DEV_ERR:
     push af
+    ld a,(CH_LAST_STATUS)
+    ld (USB_INIT_LAST_STATUS),a
+    ld hl,(CH_NAK_COUNT)
+    ld (USB_INIT_NAK_COUNT),hl
+
+    ;Diagnostics: if getting a descriptor from the device failed after the
+    ;address was assigned, check if it answers single packet requests
+    ;at the new address and at address 0.
+
+    ld a,(USB_INIT_STEP)
+    cp 4
+    jr c,_USB_INIT_DEV_ERR_2
+    cp 6
+    call c,_USB_INIT_PROBE
+_USB_INIT_DEV_ERR_2:
+
     call WK_ZERO
     pop bc
     ld a,2
@@ -375,6 +484,30 @@ _USB_INIT_DEV_END:
     ld sp,ix
     ret
 
+    ;* Get 8 bytes of the device descriptor at address 1 and at address 0,
+    ;  and store the resulting CH376 status of each transfer.
+    ;  Input: buffer at SP+4 (the caller has pushed AF)
+
+_USB_INIT_PROBE:
+    ld hl,4
+    add hl,sp
+    ex de,hl
+    push de
+    ld hl,USB_CMD_GET_DEV_DESC_8
+    ld a,USB_DEVICE_ADDRESS
+    ld b,8
+    call HW_CONTROL_TRANSFER
+    ld a,(CH_LAST_STATUS)
+    ld (USB_PROBE_ADDR1_STATUS),a
+    pop de
+    ld hl,USB_CMD_GET_DEV_DESC_8
+    xor a
+    ld b,8
+    call HW_CONTROL_TRANSFER
+    ld a,(CH_LAST_STATUS)
+    ld (USB_PROBE_ADDR0_STATUS),a
+    ret
+
     ;* Skip the current descriptor
 
 _INIT_USB_SKIP_DESC:
@@ -382,6 +515,180 @@ _INIT_USB_SKIP_DESC:
     ld d,0
     add ix,de
     ret
+
+    ;* Check if the device is being handled in single packet mode
+    ;  (see step 4 above)
+    ;  Output: Z if single packet mode, NZ if not
+    ;  Modifies A only
+
+_USB_INIT_IS_SINGLE_PACKET_MODE:
+    ld a,(PROCNM)
+    inc a
+    ret nz
+    ld a,(PROCNM+1)
+    inc a
+    ret
+
+    ;* Build a configuration descriptor for a standard CBI+UFI device
+    ;  (single interface with bulk IN, bulk OUT and interrupt IN endpoints)
+    ;  keeping the bConfigurationValue field of the actual one.
+    ;  The actual bulk endpoint numbers are found later (step 7).
+    ;  Input:  IX = Buffer with the first 8 bytes of the configuration descriptor
+    ;  Preserves IX
+
+_USB_INIT_FAKE_CONFIG_DESC:
+    ld a,(ix+5)
+    push af
+    push ix
+    pop de
+    ld hl,_USB_FAKE_CONFIG_DESC
+    ld bc,_USB_FAKE_CONFIG_DESC_END-_USB_FAKE_CONFIG_DESC
+    ldir
+    pop af
+    ld (ix+5),a
+    ret
+
+_USB_FAKE_CONFIG_DESC:
+    db 9, 2, _USB_FAKE_CONFIG_DESC_END-_USB_FAKE_CONFIG_DESC, 0, 1, 0, 0, 80h, 50
+    db 9, 4, 0, 0, 3, USB_CLASS_MASS, USB_SUBCLASS_CBI, USB_PROTO_WITH_INT_EP, 0
+    db 7, 5, 81h, 2, 64, 0, 0   ;Bulk IN (or 82h, see step 7)
+    db 7, 5, 02h, 2, 64, 0, 0   ;Bulk OUT (or 01h, see step 7)
+    db 7, 5, 83h, 3, 2, 0, 32   ;Interrupt IN
+_USB_FAKE_CONFIG_DESC_END:
+
+    ;* Find out the actual bulk endpoint numbers of a device in single packet mode
+    ;  by sending an INQUIRY command and trying to receive the result
+    ;  from endpoint 1 and then from endpoint 2; the other one is assumed to be
+    ;  the bulk OUT endpoint. Also updates the toggle bits in the work area.
+    ;  Only the low level (HW_*) transfer routines are used, since the higher level ones
+    ;  would invoke USB_PROCESS_ERROR on error, which would re-enter USB_INIT_DEV.
+    ;  Input:  IX = Buffer of at least 48 bytes
+    ;  Output: A  = USB error code
+    ;  Preserves IX
+
+_USB_INIT_PROBE_BULK_EPS:
+    push ix     ;Buffer address, will be kept at the top of the stack
+
+    ;--- Send INQUIRY. Some drives stall on first command after reset so try a few times.
+
+    ld b,3
+_USB_PROBE_INQUIRY:
+    push bc
+    push ix
+    pop hl
+    ld de,40
+    add hl,de   ;HL = Buffer+40, for the ADSC setup packet
+    push hl
+    ex de,hl
+    ld hl,CBI_ADSC
+    ld bc,8
+    ldir
+    call WK_GET_IFACE_NUMBER
+    pop hl
+    push hl
+    ld de,4
+    add hl,de
+    ld (hl),a
+    pop hl
+    ld de,INIQUIRY_CMD
+    ld a,USB_DEVICE_ADDRESS
+    call _USB_INIT_CONTROL_TRANSFER
+    pop bc
+    pop ix
+    push ix
+    or a
+    jr z,_USB_PROBE_INQUIRY_OK
+    cp USB_ERR_STALL
+    jr nz,_USB_PROBE_END
+    djnz _USB_PROBE_INQUIRY
+    jr _USB_PROBE_END
+_USB_PROBE_INQUIRY_OK:
+
+    ;--- Get the result from endpoint 1 or 2
+
+    ld e,1
+    call _USB_PROBE_BULK_IN
+    jr z,_USB_PROBE_READ_INT
+    ld e,2
+    call _USB_PROBE_BULK_IN
+    jr nz,_USB_PROBE_END
+    ld a,82h
+    ld b,1
+    call WK_SET_EP_NUMBER
+    ld a,01h
+    ld b,0
+    call WK_SET_EP_NUMBER
+
+    ;--- Read the CBI interrupt data block to complete the command
+
+_USB_PROBE_READ_INT:
+    pop hl
+    push hl
+    ld de,0203h ;Endpoint size 2, endpoint number 3
+    ld bc,2
+    ld a,USB_DEVICE_ADDRESS
+    or a    ;Toggle = 0
+    call HW_DATA_IN_TRANSFER
+    ld b,2
+    call WK_SET_TOGGLE_BIT  ;Preserves A
+
+_USB_PROBE_END:
+    pop ix
+    ret
+
+    ;Input:  E = Endpoint number, buffer address at SP+2
+    ;Output: Z if data was received (and then the bulk IN toggle bit is updated),
+    ;        NZ and A = USB error code if not
+
+_USB_PROBE_BULK_IN:
+    ld hl,2
+    add hl,sp
+    ld a,(hl)
+    inc hl
+    ld h,(hl)
+    ld l,a
+    ld d,64
+    ld bc,36
+    ld a,USB_DEVICE_ADDRESS
+    or a    ;Toggle = 0
+    call HW_DATA_IN_TRANSFER
+    push af
+    or a
+    jr nz,_USB_PROBE_BULK_IN_ERR
+    ld a,b
+    or c
+    jr z,_USB_PROBE_BULK_IN_NO_DATA
+    pop af
+    ld b,1
+    call WK_SET_TOGGLE_BIT
+    xor a
+    ret
+_USB_PROBE_BULK_IN_NO_DATA:
+    pop af
+    ld a,USB_ERR_DATA_ERROR
+    or a
+    ret
+_USB_PROBE_BULK_IN_ERR:
+    pop af
+    or a
+    ret
+
+    ;* Perform a control transfer on endpoint 0 using the endpoint 0
+    ;  max packet size stored in the work area.
+    ;  USB_PROCESS_ERROR is not invoked on error since it would re-enter USB_INIT_DEV.
+    ;  Input:  HL = Setup packet, DE = Data buffer, A = Device address
+    ;  Output: A = USB error code, BC = Amount of data transferred
+
+_USB_INIT_CONTROL_TRANSFER:
+    push af
+    push hl
+    push de
+    ld b,2
+    call WK_GET_EP_SIZE
+    pop de
+    pop hl
+    pop af
+    jp HW_CONTROL_TRANSFER
 
 
     ;>>> USB hub found!
@@ -396,19 +703,11 @@ _USB_INIT_HUB_FOUND:
     push ix
     pop de
 
-    if HW_IMPL_GET_CONFIG_DESCR = 1
-
-    xor a
-    call HW_GET_CONFIG_DESCR
-
-    else
-
     ld hl,USB_CMD_GET_CONFIG_DESC
     push ix
-    call USB_CONTROL_TRANSFER_0
+    xor a
+    call _USB_INIT_CONTROL_TRANSFER
     pop ix
-
-    endif
 
     or a
     jp nz,_USB_HUB_INIT_END
@@ -425,7 +724,9 @@ _USB_INIT_HUB_FOUND:
     ld hl,USB_CMD_SET_HUB_ADDRESS
     ld de,0 ;No data will be actually transferred
     push ix
-    call USB_CONTROL_TRANSFER_0
+    xor a
+    call _USB_INIT_CONTROL_TRANSFER
+    call _USB_SET_ADDRESS_RECOVERY
     pop ix
 
     endif
@@ -458,7 +759,7 @@ _USB_INIT_HUB_FOUND:
     ld de,0 ;No data will be actually transferred
     ld a,HUB_DEVICE_ADDRESS
     push ix
-    call _USB_CONTROL_TRANSFER_DO
+    call _USB_INIT_CONTROL_TRANSFER
     pop ix
 
     endif
@@ -490,9 +791,7 @@ _USB_HUB_PORT_LOOP:
     call _USB_DO_HUB_CMD
     jp nz,_USB_HUB_INIT_ERR ;An error here means that the port doesn't exist
 
-    halt
-    halt
-    halt    ;Max reset time for a USB hub port is 20ms, that'll be enough
+    call _USB_HUB_WAIT_RESET
 
     ;* Try to get the device descriptor of the actual device,
     ;  just to see if there's a device at all
@@ -506,12 +805,16 @@ _USB_HUB_PORT_LOOP:
     call HW_CONTROL_TRANSFER
     pop ix
 
-    ;* Device found? Then let's go and resume normal processing
+    ;* Device found? Then reset the port again (like Windows does, so that the
+    ;  device is in a clean default state) and resume normal processing
 
     or a
     jr nz,_USB_HUB_NEXT_PORT
 
+    ld hl,USB_CMD_HUB_PORT_RESET
     pop af
+    call _USB_DO_HUB_CMD
+    call _USB_HUB_WAIT_RESET
     jp _USB_HUB_INIT_END
 
     ;--- Next port, if any
@@ -524,6 +827,9 @@ _USB_HUB_NEXT_PORT:
     jp c,_USB_HUB_PORT_LOOP
 
 _USB_HUB_INIT_END:
+    ld a,64 ;The device behind the hub may have a different endpoint 0 max packet size
+    ld b,2
+    call WK_SET_EP_SIZE
     push ix
     pop de
     jp _USB_INIT_DEV_RESTART
@@ -556,6 +862,31 @@ _USB_HUB_INIT_ERR:
     pop bc
     jr _USB_HUB_INIT_END
 
+    ;--- Wait for a hub port reset to finish and for the device to recover:
+    ;    max reset time for a USB hub port is 20ms, plus 10ms of reset recovery time.
+    ;    The CH376 is used as timer (HALT would hang if interrupts are disabled,
+    ;    and a busy loop would be too short on turbo machines).
+
+_USB_HUB_WAIT_RESET:
+    if USING_ARDUINO_BOARD = 0
+    ld bc,500
+    jp CH_DELAY
+    else
+    ret
+    endif
+
+    ;--- SET_ADDRESS recovery time: 2ms minimum, give it some more.
+    ;    Preserves AF.
+
+_USB_SET_ADDRESS_RECOVERY:
+    if USING_ARDUINO_BOARD = 0
+    push af
+    ld bc,100
+    call CH_DELAY
+    pop af
+    endif
+    ret
+
 
 
 ; -----------------------------------------------------------------------------
@@ -565,12 +896,17 @@ _USB_HUB_INIT_ERR:
 USB_CMD_GET_DEV_DESC_8:
     db 80h, 6, 0, 1, 0, 0, 8, 0
 
-    if HW_IMPL_GET_CONFIG_DESCR = 0
+USB_CMD_GET_DEV_DESC_64:
+    db 80h, 6, 0, 1, 0, 0, 64, 0
+
+USB_CMD_GET_DEV_DESC_18:
+    db 80h, 6, 0, 1, 0, 0, 18, 0
 
 USB_CMD_GET_CONFIG_DESC:
-    db 80h, 6, 0, 2, 0, 0, 128, 0
+    db 80h, 6, 0, 2, 0, 0, USB_INIT_DEV_STACK_SPACE, 0  ;Don't overflow the buffer on the stack
 
-    endif
+USB_CMD_GET_CONFIG_DESC_8:
+    db 80h, 6, 0, 2, 0, 0, 8, 0
 
 USB_CMD_SET_ADDRESS:
     db 0, 5, USB_DEVICE_ADDRESS, 0, 0, 0, 0, 0
@@ -735,7 +1071,7 @@ _USB_DATA_IN_OK:
 
 
 ; -----------------------------------------------------------------------------
-; USB_DATA_OUT_TRANSFER: Perform a USB data IN transfer
+; USB_DATA_OUT_TRANSFER: Perform a USB data OUT transfer
 ;
 ; This routine differs from HW_DATA_OUT_TRANSFER in that:
 ;
@@ -825,7 +1161,8 @@ USB_CLEAR_ENDPOINT_HALT:
     ld sp,ix
     push hl ;Was A
 
-    ex de,hl
+    push ix
+    pop de  ;DE = Buffer for the setup packet (allocated on the stack)
     push de
     ld hl,USB_CMD_CLEAR_ENDPOINT_HALT
     ld bc,8

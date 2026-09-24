@@ -57,6 +57,7 @@ DEFDPB:
     include "bank1/choice_dskfmt.asm"    
     include "bank1/work_area.asm"
     include "bank1/usb.asm"
+    include "bank1/diag_ep0.asm"
     include "bank1/misc.asm"
     include "bank1/boot_menu.asm"
     include "bank1/dsk.asm"

@@ -57,6 +57,7 @@ INIENV_IMPL:
     call WK_SET_LAST_REL_DRIVE
 
     call VERBOSE_RESET
+    ei  ;DELAY_B uses HALT
     ld b,30
     call DELAY_B
     call WK_GET_STORAGE_DEV_FLAGS
